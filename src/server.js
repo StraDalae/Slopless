@@ -10,29 +10,26 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const path = require('path');
+const { handleUpload } = require('@vercel/blob/client');
 
 const db = require('./db');
-const { uploadContentFromBuffer } = require('./upload');
+const { uploadContentFromBuffer, finalizeBufferUpload } = require('./upload');
 const { fileReport } = require('./reports');
 const { fileAppeal, resolveAppeal, autoConfirmExpiredStrikes } = require('./appeals');
 const { canPost, getRestriction } = require('./restrictions');
 const { getReviewPriority } = require('./badges');
 const { LOCAL_UPLOAD_DIR, useBlob } = require('./storage');
 
-// Memory storage: works identically in local dev and on Vercel (no local
-// disk dependency for the upload itself -- storage.js decides where the
-// bytes ultimately land).
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 200 * 1024 * 1024 }, // 200MB, plenty for MVP testing
+  limits: { fileSize: 200 * 1024 * 1024 },
 });
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Only relevant in local dev (Vercel Blob URLs are already publicly
-// reachable and don't need to be served by this app).
 if (!useBlob) {
   app.use('/uploads', express.static(LOCAL_UPLOAD_DIR));
 }
@@ -41,10 +38,8 @@ function servedPathFor(filename) {
   if (!filename) return null;
   if (filename.startsWith('http://') || filename.startsWith('https://')) return filename;
   if (filename.startsWith('/uploads/')) return filename;
-  return `/uploads/${filename.split('/').pop()}`; // legacy local-path rows (e.g. from simulate.js)
+  return `/uploads/${filename.split('/').pop()}`;
 }
-
-// ---------- Users ----------
 
 app.post('/users', async (req, res) => {
   const { username, followers = 0 } = req.body;
@@ -84,8 +79,6 @@ app.get('/users/:id/status', async (req, res) => {
   }
 });
 
-// ---------- Content / Feed ----------
-
 app.post('/content/upload', upload.single('file'), async (req, res) => {
   const userId = Number(req.body.userId);
   const kind = req.body.kind || 'video';
@@ -100,10 +93,45 @@ app.post('/content/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// Feed: every piece of content, newest first, joined with uploader info and
-// live report counts. Deliberately unfiltered (shows LIVE, UNDER_REVIEW,
-// and REMOVED) so the UI can visibly show status changes -- a real feed
-// would only show LIVE.
+app.post('/content/upload-authorize', async (req, res) => {
+  try {
+    const jsonResponse = await handleUpload({
+      body: req.body,
+      request: req,
+      onBeforeGenerateToken: async (pathname, clientPayload) => {
+        const { userId, kind } = JSON.parse(clientPayload || '{}');
+        if (!userId) throw new Error('userId is required');
+
+        const postCheck = await canPost(Number(userId));
+        if (!postCheck.allowed) {
+          throw new Error(
+            `Posting restricted for ${postCheck.restriction.restrictedForHours}h (${postCheck.restriction.strikes} confirmed strikes)`
+          );
+        }
+
+        return {
+          allowedContentTypes: ['image/*', 'video/*'],
+          addRandomSuffix: true,
+          maximumSizeInBytes: 200 * 1024 * 1024,
+          tokenPayload: JSON.stringify({ userId, kind: kind || 'video' }),
+        };
+      },
+      onUploadCompleted: async ({ blob, tokenPayload }) => {
+        const { userId, kind } = JSON.parse(tokenPayload);
+
+        const response = await fetch(blob.url);
+        const buffer = Buffer.from(await response.arrayBuffer());
+        const ext = path.extname(new URL(blob.url).pathname);
+
+        await finalizeBufferUpload(Number(userId), kind, buffer, ext, blob.url);
+      },
+    });
+    res.json(jsonResponse);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 app.get('/content', async (req, res) => {
   try {
     const rows = await db.all(
@@ -135,8 +163,6 @@ app.post('/content/:id/report', async (req, res) => {
   }
 });
 
-// ---------- Appeals ----------
-
 app.post('/strikes/:id/appeal', async (req, res) => {
   const { reason } = req.body;
   try {
@@ -148,7 +174,7 @@ app.post('/strikes/:id/appeal', async (req, res) => {
 });
 
 app.post('/appeals/:id/resolve', async (req, res) => {
-  const { outcome } = req.body; // 'APPROVED' | 'DENIED'
+  const { outcome } = req.body;
   try {
     const result = await resolveAppeal(Number(req.params.id), outcome);
     res.json(result);
@@ -165,8 +191,6 @@ app.post('/strikes/auto-confirm-expired', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-// ---------- Admin / mod queue ----------
 
 app.get('/admin/queue', async (req, res) => {
   try {

@@ -1,19 +1,21 @@
 // src/upload.js
-// Orchestrates what happens when a user tries to post content:
-// 1. check they're not currently restricted
-// 2. run the metadata check
-// 3. create the content row
-// 4. compute its initial badge
+// Orchestrates what happens when a user posts content. Three entry points
+// now, because large video files can't fit through a single Vercel
+// serverless function request (4.5MB body limit):
 //
-// Two entry points:
-// - uploadContent(userId, filePath, kind): takes a path already on local
-//   disk. Used by test/simulate.js and anywhere else working with local
-//   fixture files.
-// - uploadContentFromBuffer(userId, kind, buffer, originalName): takes raw
-//   upload bytes (what the HTTP API actually receives). Writes a throwaway
-//   temp file just long enough to run the metadata checker (ffprobe needs
-//   a real file to read), then persists the bytes via storage.js (local
-//   disk in dev, Vercel Blob in production) and discards the temp file.
+// - uploadContent(userId, filePath, kind): local file path on disk. Used
+//   by test/simulate.js and anywhere else working with local fixtures.
+// - uploadContentFromBuffer(userId, kind, buffer, originalName): raw bytes
+//   that came through our own server (small files, under the body limit --
+//   this is the direct multipart POST path, works everywhere including
+//   local dev).
+// - finalizeBufferUpload(userId, kind, buffer, ext): the shared core used
+//   by both of the above AND by the Blob "client upload" completion
+//   webhook (see server.js's /content/upload-authorize) for large files
+//   that were uploaded directly from the browser straight to Blob
+//   storage, bypassing our server's body-size limit entirely. In that
+//   case we download the bytes back from Blob just long enough to run the
+//   metadata checker, since ffprobe/exifr need a real file to read.
 
 const os = require('os');
 const fs = require('fs');
@@ -30,6 +32,26 @@ async function createContentRow(userId, kind, filenameOrUrl, tier) {
     [userId, kind, filenameOrUrl, tier]
   );
   return row.id;
+}
+
+async function finalizeBufferUpload(userId, kind, buffer, ext, finalUrl) {
+  const tempPath = path.join(
+    os.tmpdir(),
+    `hv-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`
+  );
+  fs.writeFileSync(tempPath, buffer);
+
+  let tier, reason;
+  try {
+    ({ tier, reason } = await checkMetadata(tempPath));
+  } finally {
+    fs.unlink(tempPath, () => {});
+  }
+
+  const contentId = await createContentRow(userId, kind, finalUrl, tier);
+  const badge = await computeBadge(contentId);
+
+  return { success: true, contentId, metadataTier: tier, metadataReason: reason, badge, servedPath: finalUrl };
 }
 
 async function uploadContent(userId, filePath, kind = 'video') {
@@ -51,24 +73,9 @@ async function uploadContentFromBuffer(userId, kind, buffer, originalName) {
     return { success: false, reason: 'USER_RESTRICTED', restriction: postCheck.restriction };
   }
 
-  // Write a short-lived temp file so the metadata checker (ffprobe, for
-  // video) has a real path to read. /tmp is writable during a single
-  // Vercel function invocation, which is all we need here.
-  const tempPath = path.join(os.tmpdir(), `hv-${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(originalName)}`);
-  fs.writeFileSync(tempPath, buffer);
-
-  let tier, reason;
-  try {
-    ({ tier, reason } = await checkMetadata(tempPath));
-  } finally {
-    fs.unlink(tempPath, () => {}); // best-effort cleanup, don't block the response on it
-  }
-
+  const ext = path.extname(originalName);
   const { url } = await saveFile(buffer, originalName);
-  const contentId = await createContentRow(userId, kind, url, tier);
-  const badge = await computeBadge(contentId);
-
-  return { success: true, contentId, metadataTier: tier, metadataReason: reason, badge, servedPath: url };
+  return finalizeBufferUpload(userId, kind, buffer, ext, url);
 }
 
-module.exports = { uploadContent, uploadContentFromBuffer };
+module.exports = { uploadContent, uploadContentFromBuffer, finalizeBufferUpload, createContentRow };

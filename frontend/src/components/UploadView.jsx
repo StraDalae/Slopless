@@ -54,9 +54,20 @@ export default function UploadView({ currentUserId, onUploaded }) {
         </label>
 
         <button type="submit" disabled={!file || !currentUserId || busy}>
-          {busy ? 'Running pipeline…' : 'Upload'}
+          {busy
+            ? file && file.size > api.DIRECT_UPLOAD_SIZE_LIMIT
+              ? 'Uploading + processing (large file, may take a bit)…'
+              : 'Running pipeline…'
+            : 'Upload'}
         </button>
       </form>
+
+      {file && file.size > api.DIRECT_UPLOAD_SIZE_LIMIT && (
+        <p className="panel__hint" style={{ marginTop: 8 }}>
+          This file is over 4MB, so it'll upload directly to storage and get processed in the
+          background — expect a few extra seconds compared to small files.
+        </p>
+      )}
 
       {error && <div className="alert alert--error">{error}</div>}
 
