@@ -23,28 +23,18 @@ try {
 
 const useBlob = !!(process.env.VERCEL || process.env.BLOB_READ_WRITE_TOKEN);
 
-/**
- * Persist a file buffer somewhere durable and return a playable URL.
- * @param {Buffer} buffer
- * @param {string} originalName - used only to preserve the file extension
- * @returns {Promise<{url: string, isRemote: boolean}>}
- */
 async function saveFile(buffer, originalName) {
   const ext = path.extname(originalName) || '';
   const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
 
   if (useBlob) {
-    try {
-      const { put } = require('@vercel/blob');
-      const blob = await put(unique, buffer, { access: 'public' });
-      return { url: blob.url, isRemote: true };
-    } catch (err) {
-      // Most likely cause: running on Vercel but no Blob store connected to
-      // this project yet. Fall through to local /tmp-ish write below rather
-      // than crashing the request -- it won't persist between invocations,
-      // but at least the upload doesn't hard-fail.
-      console.error('[storage] Vercel Blob upload failed, falling back to local write:', err.message);
-    }
+    // No fallback here on purpose: if this throws, let it throw. Falling
+    // back to a local disk write would just fail again with a much more
+    // confusing EROFS error, since Vercel's filesystem is read-only outside
+    // /tmp -- better to see the real Blob error than mask it with that.
+    const { put } = require('@vercel/blob');
+    const blob = await put(unique, buffer, { access: 'public' });
+    return { url: blob.url, isRemote: true };
   }
 
   const destPath = path.join(LOCAL_UPLOAD_DIR, unique);
