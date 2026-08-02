@@ -19,7 +19,7 @@ const { fileReport } = require('./reports');
 const { fileAppeal, resolveAppeal, autoConfirmExpiredStrikes } = require('./appeals');
 const { canPost, getRestriction } = require('./restrictions');
 const { getReviewPriority } = require('./badges');
-const { LOCAL_UPLOAD_DIR, useBlob } = require('./storage');
+const { LOCAL_UPLOAD_DIR, useBlob, BLOB_TOKEN } = require('./storage');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -98,6 +98,7 @@ app.post('/content/upload-authorize', async (req, res) => {
     const jsonResponse = await handleUpload({
       body: req.body,
       request: req,
+      token: BLOB_TOKEN,
       onBeforeGenerateToken: async (pathname, clientPayload) => {
         const { userId, kind } = JSON.parse(clientPayload || '{}');
         if (!userId) throw new Error('userId is required');
