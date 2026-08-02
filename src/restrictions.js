@@ -1,9 +1,6 @@
 // src/restrictions.js
-//
 // Temporary posting restrictions based on CONFIRMED strikes only (never
-// pending ones -- see appeals.js for why). Thresholds are deliberately
-// simple and tunable; this is the kind of thing you'll want to A/B once
-// you have real users.
+// pending ones -- see appeals.js for why).
 
 const { confirmedStrikeCount } = require('./appeals');
 
@@ -18,16 +15,15 @@ const RESTRICTION_LADDER = [
  * Given a user's confirmed strike count, determine if/how long they should
  * be restricted from posting new content. Returns null if not restricted.
  */
-function getRestriction(userId) {
-  const strikes = confirmedStrikeCount(userId);
-  // Find the highest rung reached.
+async function getRestriction(userId) {
+  const strikes = await confirmedStrikeCount(userId);
   const rung = [...RESTRICTION_LADDER].reverse().find((r) => strikes >= r.atStrikes);
   if (!rung) return null;
   return { strikes, restrictedForHours: rung.hours };
 }
 
-function canPost(userId) {
-  const restriction = getRestriction(userId);
+async function canPost(userId) {
+  const restriction = await getRestriction(userId);
   return { allowed: restriction === null, restriction };
 }
 

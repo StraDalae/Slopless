@@ -1,0 +1,89 @@
+/* Design tokens -- night telemetry palette
+   bg:        #0B0E14  near-black navy
+   surface:   #131826  panel/card background
+   surface-2: #1B2233  raised surface (inputs, hover)
+   border:    #262E42
+   text:      #E7EBF3
+   muted:     #7C8698
+   good:      #35D68C  (verified / live / approved)
+   warn:      #E8B339  (unverified / pending / under review)
+   alert:     #FF5C6C  (AI signature / removed / denied)
+   accent:    #5B8CFF  (interactive / links / focus)
+*/
+:root {
+  --bg: #0b0e14;
+  --surface: #131826;
+  --surface-2: #1b2233;
+  --border: #262e42;
+  --text: #e7ebf3;
+  --muted: #7c8698;
+  --good: #35d68c;
+  --warn: #e8b339;
+  --alert: #ff5c6c;
+  --accent: #5b8cff;
+
+  --mono: 'SFMono-Regular', ui-monospace, 'JetBrains Mono', Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--sans);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin: 0 0 4px;
+}
+
+button {
+  font-family: var(--sans);
+  cursor: pointer;
+}
+
+input,
+select,
+textarea {
+  font-family: var(--sans);
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+a {
+  color: var(--accent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

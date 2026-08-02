@@ -1,17 +1,8 @@
 // src/badges.js
-//
-// Design decision from our discussion: badge eligibility is decoupled from
-// follower count. A big follower count is a popularity signal, not a
-// provenance signal, and "auto-badge above X followers" is an easy target
-// for someone who farms followers on real content then slips in AI content
-// once they're past the threshold.
-//
-// Instead: every piece of content is judged on its own metadata tier +
-// the poster's confirmed-strike history. High-follower accounts get a
-// FAST-TRACK REVIEW QUEUE (reviewed sooner, not skipped) -- see
-// getReviewPriority() below. Flip ENABLE_FOLLOWER_AUTO_BADGE if you want
-// to test the original always-badge behavior anyway, but the risk above
-// is real and this defaults to off.
+// Badge eligibility is decoupled from follower count -- see the README for
+// why (follower count is a popularity signal, not a provenance signal).
+// High-follower accounts get a FAST-TRACK REVIEW QUEUE instead of an
+// auto-badge (getReviewPriority() below).
 
 const { TIERS } = require('./metadata');
 const { confirmedStrikeCount } = require('./appeals');
@@ -31,31 +22,30 @@ const BADGE = {
  * Re-run this any time relevant state changes (e.g. after a strike is
  * confirmed) since badges are revocable retroactively.
  */
-function computeBadge(contentId) {
-  const content = db.prepare('SELECT * FROM content WHERE id = ?').get(contentId);
+async function computeBadge(contentId) {
+  const content = await db.get('SELECT * FROM content WHERE id = $1', [contentId]);
   if (!content) throw new Error(`No content with id ${contentId}`);
 
   if (content.badge_revoked) {
-    db.prepare('UPDATE content SET badge_tier = NULL WHERE id = ?').run(contentId);
+    await db.query('UPDATE content SET badge_tier = NULL WHERE id = $1', [contentId]);
     return BADGE.NONE;
   }
 
   if (content.metadata_tier === TIERS.AI_SIGNATURE_DETECTED) {
-    db.prepare('UPDATE content SET badge_tier = NULL WHERE id = ?').run(contentId);
+    await db.query('UPDATE content SET badge_tier = NULL WHERE id = $1', [contentId]);
     return BADGE.NONE;
   }
 
-  const strikes = confirmedStrikeCount(content.user_id);
+  const strikes = await confirmedStrikeCount(content.user_id);
   let tier;
 
   if (content.metadata_tier === TIERS.CAMERA_VERIFIED && strikes === 0) {
     tier = BADGE.HUMAN_VERIFIED;
   } else {
-    // EDITED_UNKNOWN or NO_METADATA -> can't make the strong claim either way
     tier = BADGE.UNVERIFIED;
   }
 
-  db.prepare('UPDATE content SET badge_tier = ? WHERE id = ?').run(tier, contentId);
+  await db.query('UPDATE content SET badge_tier = $1 WHERE id = $2', [tier, contentId]);
   return tier;
 }
 
@@ -64,8 +54,8 @@ function computeBadge(contentId) {
  * has a large following and mistakes reach more people faster)? This is the
  * "fast-track" alternative to auto-badging high-follower accounts.
  */
-function getReviewPriority(userId) {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+async function getReviewPriority(userId) {
+  const user = await db.get('SELECT * FROM users WHERE id = $1', [userId]);
   if (!user) throw new Error(`No user with id ${userId}`);
   return user.followers >= FAST_TRACK_FOLLOWER_THRESHOLD ? 'HIGH' : 'NORMAL';
 }

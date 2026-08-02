@@ -1,83 +1,201 @@
 // src/server.js
-// Thin HTTP layer over the pipeline modules. This is here so you can poke
-// at the system with curl/Postman if you want, but test/simulate.js is the
-// faster way to walk through end-to-end scenarios.
+// HTTP API over the pipeline modules, built to support the frontend's three
+// views: upload, feed, and admin/mod queue.
+//
+// NOTE ON AUTH: there is none. Every request just takes a userId in the
+// body/query -- this stands in for "who's logged in" so we can test the
+// pipeline without building a real auth system. Do NOT ship this as-is;
+// swap in real sessions/auth before this touches real users.
 
 const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+
 const db = require('./db');
-const { uploadContent } = require('./upload');
+const { uploadContentFromBuffer } = require('./upload');
 const { fileReport } = require('./reports');
 const { fileAppeal, resolveAppeal, autoConfirmExpiredStrikes } = require('./appeals');
 const { canPost, getRestriction } = require('./restrictions');
-const { computeBadge, getReviewPriority } = require('./badges');
+const { getReviewPriority } = require('./badges');
+const { LOCAL_UPLOAD_DIR, useBlob } = require('./storage');
+
+// Memory storage: works identically in local dev and on Vercel (no local
+// disk dependency for the upload itself -- storage.js decides where the
+// bytes ultimately land).
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 200 * 1024 * 1024 }, // 200MB, plenty for MVP testing
+});
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
-app.post('/users', (req, res) => {
+// Only relevant in local dev (Vercel Blob URLs are already publicly
+// reachable and don't need to be served by this app).
+if (!useBlob) {
+  app.use('/uploads', express.static(LOCAL_UPLOAD_DIR));
+}
+
+function servedPathFor(filename) {
+  if (!filename) return null;
+  if (filename.startsWith('http://') || filename.startsWith('https://')) return filename;
+  if (filename.startsWith('/uploads/')) return filename;
+  return `/uploads/${filename.split('/').pop()}`; // legacy local-path rows (e.g. from simulate.js)
+}
+
+// ---------- Users ----------
+
+app.post('/users', async (req, res) => {
   const { username, followers = 0 } = req.body;
-  const result = db
-    .prepare('INSERT INTO users (username, followers) VALUES (?, ?)')
-    .run(username, followers);
-  res.json({ id: result.lastInsertRowid, username, followers });
+  if (!username) return res.status(400).json({ error: 'username is required' });
+  try {
+    const row = await db.get(
+      'INSERT INTO users (username, followers) VALUES ($1, $2) RETURNING id',
+      [username, followers]
+    );
+    res.json({ id: row.id, username, followers });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
-app.post('/content/upload', async (req, res) => {
-  const { userId, filePath, kind } = req.body;
+app.get('/users', async (req, res) => {
   try {
-    const result = await uploadContent(userId, filePath, kind);
+    const users = await db.all(
+      'SELECT id, username, followers, reporter_trust FROM users ORDER BY id'
+    );
+    res.json(users);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/users/:id/status', async (req, res) => {
+  const userId = Number(req.params.id);
+  try {
+    const [postingStatus, reviewPriority] = await Promise.all([
+      canPost(userId),
+      getReviewPriority(userId),
+    ]);
+    res.json({ postingStatus, reviewPriority });
+  } catch (err) {
+    res.status(404).json({ error: err.message });
+  }
+});
+
+// ---------- Content / Feed ----------
+
+app.post('/content/upload', upload.single('file'), async (req, res) => {
+  const userId = Number(req.body.userId);
+  const kind = req.body.kind || 'video';
+  if (!req.file) return res.status(400).json({ error: 'file is required (field name "file")' });
+  if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+  try {
+    const result = await uploadContentFromBuffer(userId, kind, req.file.buffer, req.file.originalname);
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-app.post('/content/:id/report', (req, res) => {
+// Feed: every piece of content, newest first, joined with uploader info and
+// live report counts. Deliberately unfiltered (shows LIVE, UNDER_REVIEW,
+// and REMOVED) so the UI can visibly show status changes -- a real feed
+// would only show LIVE.
+app.get('/content', async (req, res) => {
+  try {
+    const rows = await db.all(
+      `SELECT c.id, c.kind, c.filename, c.metadata_tier, c.status, c.badge_tier,
+              c.badge_revoked, c.created_at,
+              u.id as user_id, u.username, u.followers,
+              (SELECT COUNT(*)::int FROM reports r WHERE r.content_id = c.id) as report_count,
+              (SELECT s.id FROM strikes s WHERE s.content_id = c.id AND s.status = 'PENDING'
+                ORDER BY s.id DESC LIMIT 1) as pending_strike_id,
+              (SELECT a.id FROM appeals a JOIN strikes s2 ON s2.id = a.strike_id
+                WHERE s2.content_id = c.id AND s2.status = 'PENDING' LIMIT 1) as pending_appeal_id
+       FROM content c JOIN users u ON u.id = c.user_id
+       ORDER BY c.id DESC`
+    );
+    res.json(rows.map((r) => ({ ...r, servedPath: servedPathFor(r.filename) })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/content/:id/report', async (req, res) => {
   const { reporterId } = req.body;
+  if (!reporterId) return res.status(400).json({ error: 'reporterId is required' });
   try {
-    const result = fileReport(Number(req.params.id), reporterId);
+    const result = await fileReport(Number(req.params.id), Number(reporterId));
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-app.post('/strikes/:id/appeal', (req, res) => {
+// ---------- Appeals ----------
+
+app.post('/strikes/:id/appeal', async (req, res) => {
   const { reason } = req.body;
   try {
-    const result = fileAppeal(Number(req.params.id), reason);
+    const result = await fileAppeal(Number(req.params.id), reason);
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-app.post('/appeals/:id/resolve', (req, res) => {
+app.post('/appeals/:id/resolve', async (req, res) => {
   const { outcome } = req.body; // 'APPROVED' | 'DENIED'
   try {
-    const result = resolveAppeal(Number(req.params.id), outcome);
+    const result = await resolveAppeal(Number(req.params.id), outcome);
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-app.post('/strikes/auto-confirm-expired', (req, res) => {
-  const confirmed = autoConfirmExpiredStrikes();
-  res.json({ confirmedStrikeIds: confirmed });
+app.post('/strikes/auto-confirm-expired', async (req, res) => {
+  try {
+    const confirmed = await autoConfirmExpiredStrikes();
+    res.json({ confirmedStrikeIds: confirmed });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get('/users/:id/status', (req, res) => {
-  const userId = Number(req.params.id);
-  res.json({
-    postingStatus: canPost(userId),
-    reviewPriority: getReviewPriority(userId),
-  });
+// ---------- Admin / mod queue ----------
+
+app.get('/admin/queue', async (req, res) => {
+  try {
+    const rows = await db.all(
+      `SELECT s.id as strike_id, s.status as strike_status, s.created_at as strike_created_at,
+              c.id as content_id, c.kind, c.filename, c.metadata_tier, c.status as content_status,
+              u.id as user_id, u.username,
+              (SELECT COUNT(*)::int FROM reports r WHERE r.content_id = c.id) as report_count,
+              a.id as appeal_id, a.reason as appeal_reason, a.status as appeal_status
+       FROM strikes s
+       JOIN content c ON c.id = s.content_id
+       JOIN users u ON u.id = s.user_id
+       LEFT JOIN appeals a ON a.strike_id = s.id
+       WHERE s.status = 'PENDING'
+       ORDER BY s.id DESC`
+    );
+    res.json({
+      pendingStrikes: rows.map((r) => ({ ...r, servedPath: servedPathFor(r.filename) })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
+
+app.get('/health', (req, res) => res.json({ ok: true, storage: useBlob ? 'vercel-blob' : 'local-disk' }));
 
 const PORT = process.env.PORT || 3000;
 if (require.main === module) {
-  app.listen(PORT, () => console.log(`HumanVerify MVP backend listening on :${PORT}`));
+  app.listen(PORT, () => console.log(`HumanVerify MVP backend listening on http://localhost:${PORT}`));
 }
 
 module.exports = app;
