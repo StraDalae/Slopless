@@ -34,11 +34,37 @@ const pool = new Pool({
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
-    username TEXT UNIQUE NOT NULL,
+    username TEXT NOT NULL,
+    email TEXT,
+    google_sub TEXT,
+    avatar_url TEXT,
+    is_admin BOOLEAN NOT NULL DEFAULT false,
     followers INTEGER NOT NULL DEFAULT 0,
     reporter_trust REAL NOT NULL DEFAULT 1.0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   );
+
+  -- Migration for databases created before auth existed: add the new
+  -- columns and drop the old "username must be unique" constraint (display
+  -- names aren't unique across people; email/google_sub are what's unique
+  -- now). All guarded so this is safe to run on every cold start.
+  ALTER TABLE users DROP CONSTRAINT IF EXISTS users_username_key;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub TEXT;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false;
+
+  DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_email_key') THEN
+      ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email);
+    END IF;
+  END $$;
+
+  DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_google_sub_key') THEN
+      ALTER TABLE users ADD CONSTRAINT users_google_sub_key UNIQUE (google_sub);
+    END IF;
+  END $$;
 
   CREATE TABLE IF NOT EXISTS content (
     id SERIAL PRIMARY KEY,

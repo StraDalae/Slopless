@@ -14,7 +14,7 @@ export default function FeedView({ content, currentUserId, onRefresh }) {
     setReportingId(contentId);
     setMessage(null);
     try {
-      const res = await api.reportContent(contentId, currentUserId);
+      const res = await api.reportContent(contentId);
       if (res.recorded === false) {
         setMessage(`Not recorded: ${res.reason}`);
       } else if (res.flagged) {

@@ -1,69 +1,96 @@
 // src/App.jsx
 import { useState, useEffect, useCallback } from 'react';
+import { GoogleOAuthProvider } from '@react-oauth/google';
 import { api } from './api';
-import Badge from './components/Badge';
+import LoginView from './components/LoginView';
 import UploadView from './components/UploadView';
 import FeedView from './components/FeedView';
 import AdminView from './components/AdminView';
 import './App.css';
 
-const TABS = [
-  { id: 'upload', label: 'Upload' },
-  { id: 'feed', label: 'Feed' },
-  { id: 'admin', label: 'Mod Queue' },
-];
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID;
 
-export default function App() {
+function AppShell() {
+  const [user, setUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authError, setAuthError] = useState(null);
+
   const [tab, setTab] = useState('upload');
-  const [users, setUsers] = useState([]);
-  const [currentUserId, setCurrentUserId] = useState(null);
-  const [newUsername, setNewUsername] = useState('');
   const [content, setContent] = useState([]);
   const [queue, setQueue] = useState([]);
   const [status, setStatus] = useState(null);
   const [loadError, setLoadError] = useState(null);
 
-  const refreshUsers = useCallback(async () => {
-    const list = await api.listUsers();
-    setUsers(list);
-    if (!currentUserId && list.length > 0) setCurrentUserId(list[0].id);
-  }, [currentUserId]);
-
-  const refreshContent = useCallback(async () => {
-    setContent(await api.listContent());
+  // On load: if a token is already stored, validate it against /auth/me
+  // rather than trusting it blindly (it may have expired).
+  useEffect(() => {
+    if (!api.isSignedIn()) {
+      setAuthChecked(true);
+      return;
+    }
+    api
+      .me()
+      .then(({ user, postingStatus, reviewPriority }) => {
+        setUser(user);
+        setStatus({ postingStatus, reviewPriority });
+      })
+      .catch(() => {
+        api.signOut(); // stale/invalid token
+      })
+      .finally(() => setAuthChecked(true));
   }, []);
 
-  const refreshQueue = useCallback(async () => {
-    const res = await api.adminQueue();
-    setQueue(res.pendingStrikes);
-  }, []);
+  const refreshContent = useCallback(() => api.listContent().then(setContent), []);
+  const refreshQueue = useCallback(() => {
+    if (!user?.isAdmin) return Promise.resolve();
+    return api.adminQueue().then((res) => setQueue(res.pendingStrikes));
+  }, [user]);
+  const refreshStatus = useCallback(() => {
+    if (!user) return Promise.resolve();
+    return api.me().then(({ postingStatus, reviewPriority }) => setStatus({ postingStatus, reviewPriority }));
+  }, [user]);
 
   const refreshAll = useCallback(async () => {
     try {
-      await Promise.all([refreshUsers(), refreshContent(), refreshQueue()]);
+      await Promise.all([refreshContent(), refreshQueue(), refreshStatus()]);
       setLoadError(null);
     } catch (err) {
-      setLoadError(`Can't reach the backend at localhost:3000 — is it running? (${err.message})`);
+      setLoadError(`Can't reach the backend -- is it running/deployed? (${err.message})`);
     }
-  }, [refreshUsers, refreshContent, refreshQueue]);
+  }, [refreshContent, refreshQueue, refreshStatus]);
 
   useEffect(() => {
-    refreshAll();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    if (user) refreshAll();
+  }, [user]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
-    if (!currentUserId) return;
-    api.userStatus(currentUserId).then(setStatus).catch(() => setStatus(null));
-  }, [currentUserId, content]);
-
-  async function handleCreateUser(e) {
-    e.preventDefault();
-    if (!newUsername.trim()) return;
-    const user = await api.createUser(newUsername.trim());
-    setNewUsername('');
-    await refreshUsers();
-    setCurrentUserId(user.id);
+  function handleSignedIn(nextUser, error) {
+    if (error) {
+      setAuthError(error);
+      return;
+    }
+    setAuthError(null);
+    setUser(nextUser);
   }
+
+  function handleSignOut() {
+    api.signOut();
+    setUser(null);
+    setContent([]);
+    setQueue([]);
+    setStatus(null);
+  }
+
+  if (!authChecked) return null; // avoid a login-screen flash while validating a stored token
+
+  if (!user) {
+    return <LoginView onSignedIn={handleSignedIn} error={authError} />;
+  }
+
+  const TABS = [
+    { id: 'upload', label: 'Upload' },
+    { id: 'feed', label: 'Feed' },
+    ...(user.isAdmin ? [{ id: 'admin', label: 'Mod Queue' }] : []),
+  ];
 
   return (
     <div className="app">
@@ -74,34 +101,22 @@ export default function App() {
         </div>
 
         <div className="app__user-controls">
-          <select
-            value={currentUserId || ''}
-            onChange={(e) => setCurrentUserId(Number(e.target.value))}
-          >
-            <option value="" disabled>
-              Post as…
-            </option>
-            {users.map((u) => (
-              <option key={u.id} value={u.id}>
-                @{u.username} ({u.followers} followers)
-              </option>
-            ))}
-          </select>
-
-          <form className="new-user-form" onSubmit={handleCreateUser}>
-            <input
-              placeholder="new username"
-              value={newUsername}
-              onChange={(e) => setNewUsername(e.target.value)}
-            />
-            <button type="submit">+ Add</button>
-          </form>
+          <span className="current-user">
+            {user.avatarUrl && <img src={user.avatarUrl} alt="" className="current-user__avatar" />}
+            <span>
+              {user.username}
+              {user.isAdmin && <span className="admin-badge">ADMIN</span>}
+            </span>
+          </span>
+          <button className="btn-secondary" style={{ width: 'auto' }} onClick={handleSignOut}>
+            Sign out
+          </button>
         </div>
       </header>
 
       {status && !status.postingStatus.allowed && (
         <div className="alert alert--error app__restriction-banner">
-          Current user is restricted from posting for {status.postingStatus.restriction.restrictedForHours}h
+          You're restricted from posting for {status.postingStatus.restriction.restrictedForHours}h
           ({status.postingStatus.restriction.strikes} confirmed strikes).
         </div>
       )}
@@ -122,10 +137,29 @@ export default function App() {
       </nav>
 
       <main className="app__main">
-        {tab === 'upload' && <UploadView currentUserId={currentUserId} onUploaded={refreshAll} />}
-        {tab === 'feed' && <FeedView content={content} currentUserId={currentUserId} onRefresh={refreshAll} />}
-        {tab === 'admin' && <AdminView queue={queue} onRefresh={refreshAll} />}
+        {tab === 'upload' && <UploadView onUploaded={refreshAll} />}
+        {tab === 'feed' && <FeedView content={content} currentUserId={user.id} onRefresh={refreshAll} />}
+        {tab === 'admin' && user.isAdmin && <AdminView queue={queue} onRefresh={refreshAll} />}
       </main>
     </div>
+  );
+}
+
+export default function App() {
+  if (!GOOGLE_CLIENT_ID) {
+    return (
+      <div className="login-screen">
+        <div className="login-card">
+          <div className="alert alert--error">
+            VITE_GOOGLE_CLIENT_ID is not set. Add it as an environment variable and rebuild.
+          </div>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <GoogleOAuthProvider clientId={GOOGLE_CLIENT_ID}>
+      <AppShell />
+    </GoogleOAuthProvider>
   );
 }

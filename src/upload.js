@@ -34,6 +34,13 @@ async function createContentRow(userId, kind, filenameOrUrl, tier) {
   return row.id;
 }
 
+/**
+ * Shared core: given raw file bytes already sitting in memory, run the
+ * metadata check (via a short-lived temp file) and create the content row.
+ * `finalUrl` is where the bytes are ALREADY durably stored (a Blob URL, or
+ * a local /uploads path) -- this function doesn't do the storing itself
+ * when finalUrl is passed in, only the classification + DB bookkeeping.
+ */
 async function finalizeBufferUpload(userId, kind, buffer, ext, finalUrl) {
   const tempPath = path.join(
     os.tmpdir(),

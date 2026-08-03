@@ -1,11 +1,12 @@
 // src/server.js
-// HTTP API over the pipeline modules, built to support the frontend's three
-// views: upload, feed, and admin/mod queue.
+// HTTP API over the pipeline modules.
 //
-// NOTE ON AUTH: there is none. Every request just takes a userId in the
-// body/query -- this stands in for "who's logged in" so we can test the
-// pipeline without building a real auth system. Do NOT ship this as-is;
-// swap in real sessions/auth before this touches real users.
+// AUTH: every write action (upload, report, appeal) now requires a valid
+// Google-verified session -- see auth.js. There is no more "post as any
+// user" impersonation dropdown; req.user.id comes only from a token we
+// signed ourselves after verifying Google's ID token. Mod actions
+// (resolving appeals, viewing the queue) additionally require
+// req.user.isAdmin, which is only ever true for the email in ADMIN_EMAIL.
 
 const express = require('express');
 const cors = require('cors');
@@ -20,6 +21,13 @@ const { fileAppeal, resolveAppeal, autoConfirmExpiredStrikes } = require('./appe
 const { canPost, getRestriction } = require('./restrictions');
 const { getReviewPriority } = require('./badges');
 const { LOCAL_UPLOAD_DIR, useBlob, BLOB_TOKEN } = require('./storage');
+const {
+  verifyGoogleIdToken,
+  upsertUserFromGoogle,
+  signSession,
+  requireAuth,
+  requireAdmin,
+} = require('./auth');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -41,99 +49,51 @@ function servedPathFor(filename) {
   return `/uploads/${filename.split('/').pop()}`;
 }
 
-app.post('/users', async (req, res) => {
-  const { username, followers = 0 } = req.body;
-  if (!username) return res.status(400).json({ error: 'username is required' });
+// ---------- Auth ----------
+
+app.post('/auth/google', async (req, res) => {
+  const { credential } = req.body;
+  if (!credential) return res.status(400).json({ error: 'credential is required' });
+
   try {
-    const row = await db.get(
-      'INSERT INTO users (username, followers) VALUES ($1, $2) RETURNING id',
-      [username, followers]
-    );
-    res.json({ id: row.id, username, followers });
+    const profile = await verifyGoogleIdToken(credential);
+    if (!profile.emailVerified) {
+      return res.status(403).json({ error: 'Google account email is not verified.' });
+    }
+    const user = await upsertUserFromGoogle(profile);
+    const token = signSession(user);
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        avatarUrl: user.avatar_url,
+        isAdmin: user.is_admin,
+      },
+    });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(401).json({ error: `Google sign-in failed: ${err.message}` });
   }
 });
 
-app.get('/users', async (req, res) => {
+// Frontend calls this on load to validate a stored token and get fresh
+// posting-status info in one round trip.
+app.get('/auth/me', requireAuth, async (req, res) => {
   try {
-    const users = await db.all(
-      'SELECT id, username, followers, reporter_trust FROM users ORDER BY id'
-    );
-    res.json(users);
+    const [postingStatus, reviewPriority] = await Promise.all([
+      canPost(req.user.id),
+      getReviewPriority(req.user.id),
+    ]);
+    res.json({ user: req.user, postingStatus, reviewPriority });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/users/:id/status', async (req, res) => {
-  const userId = Number(req.params.id);
-  try {
-    const [postingStatus, reviewPriority] = await Promise.all([
-      canPost(userId),
-      getReviewPriority(userId),
-    ]);
-    res.json({ postingStatus, reviewPriority });
-  } catch (err) {
-    res.status(404).json({ error: err.message });
-  }
-});
+// ---------- Content / Feed ----------
 
-app.post('/content/upload', upload.single('file'), async (req, res) => {
-  const userId = Number(req.body.userId);
-  const kind = req.body.kind || 'video';
-  if (!req.file) return res.status(400).json({ error: 'file is required (field name "file")' });
-  if (!userId) return res.status(400).json({ error: 'userId is required' });
-
-  try {
-    const result = await uploadContentFromBuffer(userId, kind, req.file.buffer, req.file.originalname);
-    res.json(result);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.post('/content/upload-authorize', async (req, res) => {
-  try {
-    const jsonResponse = await handleUpload({
-      body: req.body,
-      request: req,
-      token: BLOB_TOKEN,
-      onBeforeGenerateToken: async (pathname, clientPayload) => {
-        const { userId, kind } = JSON.parse(clientPayload || '{}');
-        if (!userId) throw new Error('userId is required');
-
-        const postCheck = await canPost(Number(userId));
-        if (!postCheck.allowed) {
-          throw new Error(
-            `Posting restricted for ${postCheck.restriction.restrictedForHours}h (${postCheck.restriction.strikes} confirmed strikes)`
-          );
-        }
-
-        return {
-          allowedContentTypes: ['image/*', 'video/*'],
-          addRandomSuffix: true,
-          maximumSizeInBytes: 200 * 1024 * 1024,
-          tokenPayload: JSON.stringify({ userId, kind: kind || 'video' }),
-        };
-      },
-      onUploadCompleted: async ({ blob, tokenPayload }) => {
-        const { userId, kind } = JSON.parse(tokenPayload);
-
-        const response = await fetch(blob.url);
-        const buffer = Buffer.from(await response.arrayBuffer());
-        const ext = path.extname(new URL(blob.url).pathname);
-
-        await finalizeBufferUpload(Number(userId), kind, buffer, ext, blob.url);
-      },
-    });
-    res.json(jsonResponse);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.get('/content', async (req, res) => {
+app.get('/content', requireAuth, async (req, res) => {
   try {
     const rows = await db.all(
       `SELECT c.id, c.kind, c.filename, c.metadata_tier, c.status, c.badge_tier,
@@ -153,20 +113,78 @@ app.get('/content', async (req, res) => {
   }
 });
 
-app.post('/content/:id/report', async (req, res) => {
-  const { reporterId } = req.body;
-  if (!reporterId) return res.status(400).json({ error: 'reporterId is required' });
+app.post('/content/upload', requireAuth, upload.single('file'), async (req, res) => {
+  const kind = req.body.kind || 'video';
+  if (!req.file) return res.status(400).json({ error: 'file is required (field name "file")' });
+
   try {
-    const result = await fileReport(Number(req.params.id), Number(reporterId));
+    const result = await uploadContentFromBuffer(req.user.id, kind, req.file.buffer, req.file.originalname);
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-app.post('/strikes/:id/appeal', async (req, res) => {
+// Large-file path: browser uploads directly to Blob storage, this route
+// only issues the short-lived upload token (onBeforeGenerateToken) and
+// handles the completion webhook (onUploadCompleted). Identity comes from
+// req.user (verified server-side), NOT from the client-supplied payload --
+// the client only tells us `kind`, which isn't security-sensitive.
+app.post('/content/upload-authorize', requireAuth, async (req, res) => {
+  try {
+    const jsonResponse = await handleUpload({
+      body: req.body,
+      request: req,
+      token: BLOB_TOKEN,
+      onBeforeGenerateToken: async (pathname, clientPayload) => {
+        const postCheck = await canPost(req.user.id);
+        if (!postCheck.allowed) {
+          throw new Error(
+            `Posting restricted for ${postCheck.restriction.restrictedForHours}h (${postCheck.restriction.strikes} confirmed strikes)`
+          );
+        }
+        const { kind } = JSON.parse(clientPayload || '{}');
+        return {
+          allowedContentTypes: ['image/*', 'video/*'],
+          addRandomSuffix: true,
+          maximumSizeInBytes: 200 * 1024 * 1024,
+          tokenPayload: JSON.stringify({ userId: req.user.id, kind: kind || 'video' }),
+        };
+      },
+      onUploadCompleted: async ({ blob, tokenPayload }) => {
+        const { userId, kind } = JSON.parse(tokenPayload);
+        const response = await fetch(blob.url);
+        const buffer = Buffer.from(await response.arrayBuffer());
+        const ext = path.extname(new URL(blob.url).pathname);
+        await finalizeBufferUpload(Number(userId), kind, buffer, ext, blob.url);
+      },
+    });
+    res.json(jsonResponse);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/content/:id/report', requireAuth, async (req, res) => {
+  try {
+    const result = await fileReport(Number(req.params.id), req.user.id);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ---------- Appeals ----------
+
+app.post('/strikes/:id/appeal', requireAuth, async (req, res) => {
   const { reason } = req.body;
   try {
+    // Only the creator whose content got struck (or an admin) can appeal it.
+    const strike = await db.get('SELECT * FROM strikes WHERE id = $1', [Number(req.params.id)]);
+    if (!strike) return res.status(404).json({ error: 'No such strike.' });
+    if (strike.user_id !== req.user.id && !req.user.isAdmin) {
+      return res.status(403).json({ error: "You can only appeal strikes on your own content." });
+    }
     const result = await fileAppeal(Number(req.params.id), reason);
     res.json(result);
   } catch (err) {
@@ -174,7 +192,7 @@ app.post('/strikes/:id/appeal', async (req, res) => {
   }
 });
 
-app.post('/appeals/:id/resolve', async (req, res) => {
+app.post('/appeals/:id/resolve', requireAuth, requireAdmin, async (req, res) => {
   const { outcome } = req.body;
   try {
     const result = await resolveAppeal(Number(req.params.id), outcome);
@@ -184,7 +202,7 @@ app.post('/appeals/:id/resolve', async (req, res) => {
   }
 });
 
-app.post('/strikes/auto-confirm-expired', async (req, res) => {
+app.post('/strikes/auto-confirm-expired', requireAuth, requireAdmin, async (req, res) => {
   try {
     const confirmed = await autoConfirmExpiredStrikes();
     res.json({ confirmedStrikeIds: confirmed });
@@ -193,7 +211,9 @@ app.post('/strikes/auto-confirm-expired', async (req, res) => {
   }
 });
 
-app.get('/admin/queue', async (req, res) => {
+// ---------- Admin / mod queue ----------
+
+app.get('/admin/queue', requireAuth, requireAdmin, async (req, res) => {
   try {
     const rows = await db.all(
       `SELECT s.id as strike_id, s.status as strike_status, s.created_at as strike_created_at,

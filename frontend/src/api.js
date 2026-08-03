@@ -2,8 +2,21 @@
 import { upload as blobUpload } from '@vercel/blob/client';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:3000';
+const TOKEN_KEY = 'hv_session_token';
 
-const DIRECT_UPLOAD_SIZE_LIMIT = 4 * 1024 * 1024; // 4MB, a little headroom under Vercel's 4.5MB cap
+const DIRECT_UPLOAD_SIZE_LIMIT = 4 * 1024 * 1024; // 4MB, headroom under Vercel's 4.5MB body cap
+
+function getToken() {
+  return localStorage.getItem(TOKEN_KEY);
+}
+function setToken(token) {
+  if (token) localStorage.setItem(TOKEN_KEY, token);
+  else localStorage.removeItem(TOKEN_KEY);
+}
+function authHeaders() {
+  const token = getToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
 
 async function handleResponse(res) {
   const data = await res.json().catch(() => ({}));
@@ -14,7 +27,7 @@ async function handleResponse(res) {
 async function waitForContentByUrl(url, { timeoutMs = 20000, intervalMs = 1000 } = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const rows = await fetch(`${API_BASE}/content`).then(handleResponse);
+    const rows = await fetch(`${API_BASE}/content`, { headers: authHeaders() }).then(handleResponse);
     const match = rows.find((r) => r.filename === url || r.servedPath === url);
     if (match) return match;
     await new Promise((r) => setTimeout(r, intervalMs));
@@ -23,32 +36,44 @@ async function waitForContentByUrl(url, { timeoutMs = 20000, intervalMs = 1000 }
 }
 
 export const api = {
-  listUsers: () => fetch(`${API_BASE}/users`).then(handleResponse),
+  // ---- auth ----
+  isSignedIn: () => !!getToken(),
+  signOut: () => setToken(null),
 
-  createUser: (username, followers = 0) =>
-    fetch(`${API_BASE}/users`, {
+  signInWithGoogle: (credential) =>
+    fetch(`${API_BASE}/auth/google`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, followers }),
-    }).then(handleResponse),
+      body: JSON.stringify({ credential }),
+    })
+      .then(handleResponse)
+      .then(({ token, user }) => {
+        setToken(token);
+        return user;
+      }),
 
-  userStatus: (userId) => fetch(`${API_BASE}/users/${userId}/status`).then(handleResponse),
+  me: () => fetch(`${API_BASE}/auth/me`, { headers: authHeaders() }).then(handleResponse),
 
-  listContent: () => fetch(`${API_BASE}/content`).then(handleResponse),
+  // ---- content ----
+  listContent: () => fetch(`${API_BASE}/content`, { headers: authHeaders() }).then(handleResponse),
 
-  async uploadContent(userId, kind, file) {
+  async uploadContent(kind, file) {
     if (file.size <= DIRECT_UPLOAD_SIZE_LIMIT) {
       const form = new FormData();
-      form.append('userId', userId);
       form.append('kind', kind);
       form.append('file', file);
-      return fetch(`${API_BASE}/content/upload`, { method: 'POST', body: form }).then(handleResponse);
+      return fetch(`${API_BASE}/content/upload`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: form,
+      }).then(handleResponse);
     }
 
     const blob = await blobUpload(file.name, file, {
       access: 'public',
       handleUploadUrl: `${API_BASE}/content/upload-authorize`,
-      clientPayload: JSON.stringify({ userId, kind }),
+      clientPayload: JSON.stringify({ kind }),
+      headers: authHeaders(), // so upload-authorize knows who's uploading
     });
 
     const contentRow = await waitForContentByUrl(blob.url);
@@ -56,32 +81,30 @@ export const api = {
       success: true,
       contentId: contentRow.id,
       metadataTier: contentRow.metadata_tier,
-      metadataReason: undefined,
       badge: contentRow.badge_tier,
       servedPath: contentRow.servedPath,
     };
   },
 
-  reportContent: (contentId, reporterId) =>
+  reportContent: (contentId) =>
     fetch(`${API_BASE}/content/${contentId}/report`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reporterId }),
+      headers: authHeaders(),
     }).then(handleResponse),
 
-  adminQueue: () => fetch(`${API_BASE}/admin/queue`).then(handleResponse),
+  adminQueue: () => fetch(`${API_BASE}/admin/queue`, { headers: authHeaders() }).then(handleResponse),
 
   resolveAppeal: (appealId, outcome) =>
     fetch(`${API_BASE}/appeals/${appealId}/resolve`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ outcome }),
     }).then(handleResponse),
 
   fileAppeal: (strikeId, reason) =>
     fetch(`${API_BASE}/strikes/${strikeId}/appeal`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ reason }),
     }).then(handleResponse),
 

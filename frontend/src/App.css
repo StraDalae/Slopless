@@ -436,3 +436,48 @@
   border-color: color-mix(in srgb, var(--alert) 45%, var(--border)) !important;
   color: var(--alert) !important;
 }
+
+/* Login screen */
+.login-screen {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.login-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 32px 28px;
+  max-width: 360px;
+  width: 100%;
+}
+
+/* Current user display in header */
+.current-user {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.current-user__avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+}
+
+.admin-badge {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--good);
+  border: 1px solid color-mix(in srgb, var(--good) 40%, var(--border));
+  border-radius: 999px;
+  padding: 2px 7px;
+  margin-left: 8px;
+}

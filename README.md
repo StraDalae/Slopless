@@ -99,7 +99,50 @@ every rule without building real auth yet.
 6. **No auth, no real file storage, no video transcoding** — this is
    pipeline logic only, as requested.
 
-## Deploying (Vercel)
+## Auth setup (Google Sign-In)
+
+Every write action (upload, report, appeal, mod actions) requires a signed-in
+Google account. There's no more "post as any user" dropdown -- identity
+comes from a session token issued after Google verifies who you are, and
+mod/admin access is granted only to the email in `ADMIN_EMAIL`.
+
+**1. Create a Google OAuth Client ID** (one-time, in Google Cloud Console):
+- Go to [console.cloud.google.com](https://console.cloud.google.com) → create
+  a project (or use an existing one) → **APIs & Services → Credentials**
+- **Create Credentials → OAuth client ID → Application type: Web application**
+- Under **Authorized JavaScript origins**, add:
+  - `http://localhost:5173` (local frontend dev)
+  - `https://slopless-web-one.vercel.app` (or whatever your deployed frontend URL is)
+- No redirect URIs needed -- this uses Google Identity Services' token flow,
+  not the redirect-based OAuth flow.
+- Save, then copy the **Client ID** (looks like `123...apps.googleusercontent.com`).
+  This value is not secret -- it's fine to put in frontend code/env vars.
+
+**2. Set backend env vars** (Vercel project → Settings → Environment Variables,
+on the `slopless-api` project):
+- `GOOGLE_CLIENT_ID` = the client ID from step 1
+- `JWT_SECRET` = any long random string (used to sign session tokens --
+  generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`)
+- `ADMIN_EMAIL` = your own Google account email, lowercase. Only this
+  account gets `isAdmin: true` and can see/use the Mod Queue.
+
+**3. Set frontend env var** (on the `slopless-web` project):
+- `VITE_GOOGLE_CLIENT_ID` = the same client ID from step 1
+
+**4. Redeploy both projects** so the new env vars take effect:
+```bash
+vercel --prod          # from the project root (backend)
+cd frontend && vercel --prod   # from frontend/
+```
+
+**Local dev:** create a `.env` file in the project root (already gitignored)
+with `GOOGLE_CLIENT_ID`, `JWT_SECRET`, and `ADMIN_EMAIL`, and
+`frontend/.env` with `VITE_GOOGLE_CLIENT_ID`, then load them however you
+prefer (e.g. `node -r dotenv/config src/server.js`, or just export them in
+your shell) -- also add `http://localhost:5173` as an authorized origin in
+step 1 if you haven't already.
+
+
 
 The backend is deployment-ready: Postgres instead of local SQLite, Vercel
 Blob instead of local disk for uploaded files, and a serverless entry point

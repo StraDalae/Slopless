@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { api } from '../api';
 import Badge from './Badge';
 
-export default function UploadView({ currentUserId, onUploaded }) {
+export default function UploadView({ onUploaded }) {
   const [file, setFile] = useState(null);
   const [kind, setKind] = useState('video');
   const [busy, setBusy] = useState(false);
@@ -12,12 +12,12 @@ export default function UploadView({ currentUserId, onUploaded }) {
 
   async function handleSubmit(e) {
     e.preventDefault();
-    if (!file || !currentUserId) return;
+    if (!file) return;
     setBusy(true);
     setError(null);
     setResult(null);
     try {
-      const res = await api.uploadContent(currentUserId, kind, file);
+      const res = await api.uploadContent(kind, file);
       setResult(res);
       if (res.success) onUploaded?.();
     } catch (err) {
@@ -53,7 +53,7 @@ export default function UploadView({ currentUserId, onUploaded }) {
           />
         </label>
 
-        <button type="submit" disabled={!file || !currentUserId || busy}>
+        <button type="submit" disabled={!file || busy}>
           {busy
             ? file && file.size > api.DIRECT_UPLOAD_SIZE_LIMIT
               ? 'Uploading + processing (large file, may take a bit)…'
